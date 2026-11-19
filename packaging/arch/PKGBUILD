@@ -13,7 +13,7 @@ optdepends=('python-pillow: blurred background with the slow drift (else GTK blu
             'bgmonad: the same wallpaper as the desktop on every output')
 backup=('etc/pam.d/locklet')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('0d962daf7c68155a705aced524efbf871f8c341d7006e62169638c1660d842da')
 
 package() {
   cd $pkgname-$pkgver
