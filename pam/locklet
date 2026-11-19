@@ -1,0 +1,4 @@
+#%PAM-1.0
+# /etc/pam.d/locklet: the password of the lock screen is checked like the
+# one of a console login (pam_unix, and pam_faillock on Arch).
+auth include login

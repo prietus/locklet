@@ -1,0 +1,1366 @@
+#!/usr/bin/env python3
+"""locklet: a lock screen for river + rivermonad (or any compositor with
+ext-session-lock-v1), in the family of shotlet, waymobar and bgmonad.
+
+  locklet              lock the session
+  locklet --preview    show the lock screen in a window without locking
+                       (Esc closes it; the password is checked for real)
+  locklet idle         run the idle daemon: lock after a while without
+                       input, screens off, lock before suspending
+  locklet idle pause | resume | toggle | status
+  locklet --help
+
+The screen keeps looking the same for an instant (a screenshot taken just
+before locking) and then crossfades to the wallpaper bgmonad shows on that
+output, blurred and darkened, drifting slowly. The password is checked with
+PAM. Killing locklet does not unlock: the compositor keeps the session
+locked until a new locklet unlocks it. SIGUSR1 unlocks (for scripts).
+
+Settings: ~/.config/locklet/config.json; ~/.config/locklet/style.css is
+loaded after the built-in style (GTK CSS) to restyle it.
+"""
+
+import ctypes
+import ctypes.util
+import fcntl
+import json
+import locale
+import math
+import os
+import pwd
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "locklet")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+
+DEFAULTS = {
+    # "wallpaper": what bgmonad shows on each output (else ~/.config/wallpaper);
+    # "screenshot": the screen itself; a path to an image; or a colour "#1e1e2e"
+    "background": "wallpaper",
+    "blur": 0.025,          # blur radius, as a fraction of the screen height (0 = sharp)
+    "dim": 0.38,            # 0 = the picture as it is, 1 = black
+    "drift": True,          # a slow zoom and pan, like bgmonad's drift
+    "fps": 30,              # of the drift
+    "fade": True,           # start from a screenshot and crossfade (needs grim)
+    "clock": "%H:%M",
+    "date": "%A, %-d %B",
+    "avatar": "",           # an image; else ~/.face, AccountsService, the initial
+    "name": "",             # shown under the avatar; else the full name or the login
+    "pam_service": "",      # else "locklet" if /etc/pam.d/locklet exists, else "login"
+}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(os.path.join(CONFIG_DIR, "config.json")) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        print(f"locklet: config.json: {e}", file=sys.stderr)
+    return cfg
+
+
+def log(*a):
+    print("locklet:", *a, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# PAM, through ctypes (no python module needed)
+
+PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_ON, PAM_ERROR_MSG, PAM_TEXT_INFO = 1, 2, 3, 4
+PAM_SUCCESS, PAM_BUF_ERR, PAM_AUTH_ERR, PAM_CONV_ERR = 0, 5, 7, 19
+
+
+class PamMessage(ctypes.Structure):
+    _fields_ = [("msg_style", ctypes.c_int), ("msg", ctypes.c_char_p)]
+
+
+class PamResponse(ctypes.Structure):
+    _fields_ = [("resp", ctypes.c_void_p), ("resp_retcode", ctypes.c_int)]
+
+
+PAM_CONV_FUNC = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.POINTER(PamMessage)),
+    ctypes.POINTER(ctypes.POINTER(PamResponse)),
+    ctypes.c_void_p)
+
+
+class PamConv(ctypes.Structure):
+    _fields_ = [("conv", PAM_CONV_FUNC), ("appdata_ptr", ctypes.c_void_p)]
+
+
+_libpam = _libc = None
+
+
+def _pam_libs():
+    global _libpam, _libc
+    if _libpam is None:
+        _libpam = ctypes.CDLL(ctypes.util.find_library("pam") or "libpam.so.0")
+        _libpam.pam_start.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                                      ctypes.POINTER(PamConv), ctypes.POINTER(ctypes.c_void_p)]
+        _libpam.pam_authenticate.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _libpam.pam_end.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _libpam.pam_strerror.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _libpam.pam_strerror.restype = ctypes.c_char_p
+        _libc = ctypes.CDLL(None)
+        _libc.calloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+        _libc.calloc.restype = ctypes.c_void_p
+        _libc.strdup.argtypes = [ctypes.c_char_p]
+        _libc.strdup.restype = ctypes.c_void_p
+    return _libpam, _libc
+
+
+def pam_service(cfg):
+    if cfg.get("pam_service"):
+        return cfg["pam_service"]
+    return "locklet" if os.path.exists("/etc/pam.d/locklet") else "login"
+
+
+def authenticate(service, user, password):
+    """(ok, message). Blocks (PAM may wait a couple of seconds after a
+    wrong password), so call it from a thread."""
+    pam, libc = _pam_libs()
+    secret = password.encode()
+    said = []
+
+    def conv(n, messages, responses, _data):
+        try:
+            arr = libc.calloc(n, ctypes.sizeof(PamResponse))
+            if not arr:
+                return PAM_BUF_ERR
+            resp = ctypes.cast(arr, ctypes.POINTER(PamResponse))
+            for i in range(n):
+                m = messages[i].contents
+                if m.msg_style in (PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_ON):
+                    resp[i].resp = libc.strdup(secret)   # PAM frees it
+                elif m.msg_style in (PAM_ERROR_MSG, PAM_TEXT_INFO) and m.msg:
+                    said.append(m.msg.decode(errors="replace").strip())
+            responses[0] = resp
+            return PAM_SUCCESS
+        except Exception:
+            return PAM_CONV_ERR
+
+    callback = PAM_CONV_FUNC(conv)
+    conversation = PamConv(callback, None)
+    handle = ctypes.c_void_p()
+    r = pam.pam_start(service.encode(), user.encode(), ctypes.byref(conversation), ctypes.byref(handle))
+    if r != PAM_SUCCESS:
+        return False, f"PAM could not start ({service})"
+    r = pam.pam_authenticate(handle, 0)
+    why = "" if r == PAM_SUCCESS else (pam.pam_strerror(handle, r) or b"").decode(errors="replace")
+    pam.pam_end(handle, r)
+    if r == PAM_SUCCESS:
+        return True, ""
+    # pam_faillock says why in two lines: "The account is locked due to 3
+    # failed logins." and "(10 minutes left to unlock)"
+    said = [s for s in said if s]
+    if said:
+        return False, " ".join(said)
+    return False, "Wrong password" if r == PAM_AUTH_ERR else why
+
+
+# --------------------------------------------------------------------------
+# Backgrounds
+
+def bgmonad_wallpapers():
+    """{output: image} from the running bgmonad, or {}."""
+    path = os.path.join(RUNTIME_DIR, f"bgmonad-{os.environ.get('WAYLAND_DISPLAY', 'wayland-0')}.sock")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.4)
+            s.connect(path)
+            s.sendall(b"status\n")
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+    except OSError:
+        data = b""
+    if not data and shutil.which("bgmonad"):
+        try:
+            data = subprocess.run(["bgmonad", "status"], capture_output=True, timeout=0.6).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            data = b""
+    out = {}
+    for line in data.decode(errors="replace").splitlines():
+        name, sep, rest = line.partition(": ")
+        if sep and rest.strip().startswith("/"):
+            out[name.strip()] = rest.strip()
+    return out
+
+
+def screenshot(connector):
+    """PNG bytes of one output (uncompressed, it is only read back), or None."""
+    if not shutil.which("grim"):
+        return None
+    cmd = ["grim", "-l", "0"] + (["-o", connector] if connector else []) + ["-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=3)
+        return r.stdout if r.returncode == 0 and r.stdout else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def blurred_rgb(source, width, height, blur):
+    """(w, h, bytes RGB) of the picture covering width x height, blurred;
+    `source` is a path or PNG bytes. Done small: the GPU scales it up and,
+    blurred, it looks the same. None if it cannot be read."""
+    try:
+        import io
+        from PIL import Image, ImageFilter, ImageOps
+    except ImportError:
+        return None
+    try:
+        im = Image.open(io.BytesIO(source) if isinstance(source, bytes) else source)
+        im = ImageOps.exif_transpose(im).convert("RGB")
+    except Exception as e:
+        log(f"cannot read the background: {e}")
+        return None
+    # a quarter of the screen is plenty for a blurred picture; sharp, all of it
+    k = 0.25 if blur > 0 else 1.0
+    tw, th = max(1, int(width * k)), max(1, int(height * k))
+    im = ImageOps.fit(im, (tw, th), Image.Resampling.LANCZOS)
+    if blur > 0:
+        im = im.filter(ImageFilter.GaussianBlur(blur * th))
+    return im.width, im.height, im.tobytes()
+
+
+def find_avatar(cfg):
+    user = pwd.getpwuid(os.getuid()).pw_name
+    for p in [os.path.expanduser(cfg.get("avatar") or ""), os.path.expanduser("~/.face"),
+              os.path.expanduser("~/.face.icon"), f"/var/lib/AccountsService/icons/{user}"]:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def display_name(cfg):
+    if cfg.get("name"):
+        return cfg["name"]
+    pw = pwd.getpwuid(os.getuid())
+    return pw.pw_gecos.split(",")[0].strip() or pw.pw_name
+
+
+# --------------------------------------------------------------------------
+# State shared by the lock screen and the idle daemon, in $XDG_RUNTIME_DIR
+
+LOCK_FILE = os.path.join(RUNTIME_DIR, "locklet.lock")          # held while locklet runs
+LOCKED_FILE = os.path.join(RUNTIME_DIR, "locklet.locked")      # pid, once the session is locked
+IDLE_FILE = os.path.join(RUNTIME_DIR, "locklet-idle.lock")     # held by the idle daemon, its pid
+PAUSED_FILE = os.path.join(RUNTIME_DIR, "locklet-idle.paused") # exists while paused
+
+
+def pid_alive(pid):
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return b"locklet" in f.read()
+    except (OSError, ValueError):
+        return False
+
+
+def read_pid(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def is_locked():
+    pid = read_pid(LOCKED_FILE)
+    return bool(pid) and pid_alive(pid)
+
+
+def idle_daemon_pid():
+    pid = read_pid(IDLE_FILE)
+    return pid if pid and pid != os.getpid() and pid_alive(pid) else 0
+
+
+def hold(path):
+    """Take the lock file at `path` and write our pid in it; None if
+    another process holds it."""
+    f = open(path, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    f.seek(0)
+    f.truncate()
+    f.write(str(os.getpid()))
+    f.flush()
+    return f
+
+
+def parse_seconds(v):
+    """600, "600", "10m", "1h", "90s" -> seconds; 0 / false / "" -> 0."""
+    if v in (None, False, "", 0):
+        return 0
+    s = str(v).strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600}.get(s[-1:], None)
+    try:
+        return int(float(s[:-1]) * mult) if mult else int(float(s))
+    except ValueError:
+        raise SystemExit(f"locklet: not a duration: {v!r} (600, \"10m\", \"1h\")")
+
+
+# --------------------------------------------------------------------------
+# The idle daemon: `locklet idle`. It speaks the Wayland wire protocol
+# itself (only four interfaces are needed) and logind's D-Bus API, so it
+# needs nothing but the standard library and Gio, and no GTK.
+
+IDLE_DEFAULTS = {
+    "lock": "10m",               # lock after this long without input (0: never)
+    "screen_off": 0,             # screens off after this long, locked or not (0: never)
+    "screen_off_locked": 0,      # screens off after this long once locked (0: never; "1m")
+    "lock_before_sleep": True,   # lock before suspending or hibernating
+}
+
+
+class Wire:
+    """The client side of the Wayland wire protocol, just enough to bind
+    globals, send requests and get events: (object id, opcode, payload)."""
+
+    def __init__(self):
+        name = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+        path = name if name.startswith("/") else os.path.join(RUNTIME_DIR, name)
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+        self.next_id = 2
+        self.handlers = {}          # id -> f(opcode, payload)
+        self.buf = b""
+        self.handlers[1] = self.on_display
+
+    def new_id(self, handler=None):
+        i = self.next_id
+        self.next_id += 1
+        if handler:
+            self.handlers[i] = handler
+        return i
+
+    def send(self, obj, opcode, *args):
+        body = b""
+        for a in args:
+            if isinstance(a, str):
+                data = a.encode() + b"\0"
+                body += struct.pack("<I", len(data)) + data + b"\0" * (-len(data) % 4)
+            else:
+                body += struct.pack("<I", a)
+        self.sock.sendall(struct.pack("<IHH", obj, opcode, 8 + len(body)) + body)
+
+    def read(self):
+        """Read what arrived and dispatch it; False when the compositor is gone."""
+        try:
+            data = self.sock.recv(65536)
+        except OSError:
+            return False
+        if not data:
+            return False
+        self.buf += data
+        while len(self.buf) >= 8:
+            obj, opcode, size = struct.unpack("<IHH", self.buf[:8])
+            if len(self.buf) < size:
+                break
+            body, self.buf = self.buf[8:size], self.buf[size:]
+            h = self.handlers.get(obj)
+            if h:
+                h(opcode, body)
+        return True
+
+    def on_display(self, opcode, body):
+        if opcode == 0:                              # error
+            obj, code = struct.unpack("<II", body[:8])
+            raise SystemExit(f"locklet idle: Wayland error {code} on object {obj}: {wl_string(body, 8)[0]}")
+        if opcode == 1:                              # delete_id
+            self.handlers.pop(struct.unpack("<I", body[:4])[0], None)
+
+    def roundtrip(self, timeout=None):
+        done = []
+        cb = self.new_id(lambda op, _b: done.append(1))
+        self.send(1, 0, cb)                          # wl_display.sync
+        self.sock.settimeout(timeout)
+        try:
+            while not done:
+                if not self.read():
+                    raise SystemExit("locklet idle: the compositor went away")
+        finally:
+            self.sock.settimeout(None)
+
+
+def wl_string(body, off):
+    n = struct.unpack("<I", body[off:off + 4])[0]
+    s = body[off + 4:off + 4 + max(0, n - 1)].decode(errors="replace")
+    return s, off + 4 + n + (-n % 4)
+
+
+def gi_require(name, version):
+    import gi
+    gi.require_version(name, version)
+
+
+class IdleDaemon:
+    def __init__(self, cfg):
+        from gi.repository import GLib
+        self.GLib = GLib
+        self.cfg = cfg
+        self.lock_after = parse_seconds(cfg["lock"])
+        self.off_after = parse_seconds(cfg["screen_off"])
+        self.off_locked_after = parse_seconds(cfg["screen_off_locked"])
+        self.paused = False
+        self.screens_off = False
+        self.notifications = {}     # what -> notification id
+        self.outputs = {}           # global name -> (wl_output id, power id)
+        self.seat = self.notifier = self.power_manager = None
+        self.inhibitor = None       # logind delay lock (an fd)
+        self.wl = Wire()
+        self.registry = self.wl.new_id(self.on_global)
+        self.wl.send(1, 1, self.registry)            # wl_display.get_registry
+        self.wl.roundtrip()
+        if not self.notifier or not self.seat:
+            raise SystemExit("locklet idle: the compositor has no ext-idle-notify-v1")
+        try:
+            os.unlink(PAUSED_FILE)
+        except FileNotFoundError:
+            pass
+        self.arm()
+
+    # ---- Wayland
+
+    def bind(self, name, iface, version, handler=None):
+        i = self.wl.new_id(handler)
+        self.wl.send(self.registry, 0, name, iface, version, i)   # wl_registry.bind
+        return i
+
+    def on_global(self, opcode, body):
+        if opcode == 1:                                           # global_remove
+            name = struct.unpack("<I", body[:4])[0]
+            if name in self.outputs:
+                _out, power = self.outputs.pop(name)
+                if power:
+                    self.wl.send(power, 1)                        # zwlr_output_power_v1.destroy
+                    self.wl.handlers.pop(power, None)
+            return
+        name = struct.unpack("<I", body[:4])[0]
+        iface, off = wl_string(body, 4)
+        if iface == "wl_seat" and self.seat is None:
+            self.seat = self.bind(name, iface, 1)
+        elif iface == "ext_idle_notifier_v1":
+            self.notifier = self.bind(name, iface, 1)
+        elif iface == "zwlr_output_power_manager_v1":
+            self.power_manager = self.bind(name, iface, 1)
+            for n in list(self.outputs):
+                self.add_power(n)
+        elif iface == "wl_output":
+            self.outputs[name] = (self.bind(name, iface, 1), None)
+            self.add_power(name)
+
+    def add_power(self, name):
+        out, power = self.outputs[name]
+        if self.power_manager and not power:
+            def on_power(op, _b, name=name):
+                if op == 1 and name in self.outputs:                # failed
+                    self.outputs[name] = (self.outputs[name][0], None)
+            power = self.wl.new_id(on_power)
+            self.wl.send(self.power_manager, 0, power, out)       # get_output_power
+            self.outputs[name] = (out, power)
+            if self.screens_off:
+                self.wl.send(power, 0, 0)
+
+    def set_screens(self, on):
+        if self.screens_off == (not on):
+            return
+        self.screens_off = not on
+        for _out, power in self.outputs.values():
+            if power:
+                self.wl.send(power, 0, 1 if on else 0)            # set_mode(on/off)
+
+    def watch(self, what, seconds, idled, resumed=None):
+        """(Re)start an idle timer: idled() after `seconds` without input."""
+        old = self.notifications.pop(what, None)
+        if old:
+            self.wl.send(old, 0)                                  # destroy
+            self.wl.handlers.pop(old, None)
+        if seconds <= 0 or self.paused:
+            return
+
+        def on_event(op, _b):
+            if op == 0:
+                idled()
+            elif op == 1 and resumed:
+                resumed()
+
+        n = self.wl.new_id(on_event)
+        self.wl.send(self.notifier, 1, n, seconds * 1000, self.seat)   # get_idle_notification
+        self.notifications[what] = n
+
+    def arm(self):
+        self.watch("lock", self.lock_after, self.lock_now)
+        self.watch("off", self.off_after, lambda: self.set_screens(False), lambda: self.set_screens(True))
+        self.watch("off-locked", self.off_locked_after, self.off_if_locked, lambda: self.set_screens(True))
+
+    def off_if_locked(self):
+        if is_locked():
+            self.set_screens(False)
+
+    # ---- locking
+
+    def lock_now(self):
+        pid = read_pid(LOCK_FILE)
+        if not (pid and pid_alive(pid)):                 # not running already
+            script = os.path.realpath(sys.argv[0])
+            subprocess.Popen([sys.executable, script], start_new_session=True,
+                             stdin=subprocess.DEVNULL)
+
+    def on_locked(self):
+        # locklet tells us when the session is locked: the "screens off
+        # while locked" timer counts from now
+        self.watch("off-locked", self.off_locked_after, self.off_if_locked, lambda: self.set_screens(True))
+        return True
+
+    # ---- suspend (logind)
+
+    def setup_logind(self):
+        if not self.cfg["lock_before_sleep"]:
+            return
+        from gi.repository import Gio
+        self.Gio = Gio
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except Exception as e:
+            log(f"idle: no system bus, not locking before sleep ({e})")
+            return
+        self.bus.signal_subscribe("org.freedesktop.login1", "org.freedesktop.login1.Manager",
+                                  "PrepareForSleep", "/org/freedesktop/login1", None,
+                                  Gio.DBusSignalFlags.NONE, self.on_prepare_for_sleep)
+        self.inhibit()
+
+    def inhibit(self):
+        if self.inhibitor is not None:
+            return
+        GLib, Gio = self.GLib, self.Gio
+        try:
+            res, fds = self.bus.call_with_unix_fd_list_sync(
+                "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                "Inhibit", GLib.Variant("(ssss)", ("sleep", "locklet", "Lock the screen before sleeping", "delay")),
+                GLib.VariantType("(h)"), Gio.DBusCallFlags.NONE, -1, None, None)
+            self.inhibitor = fds.get(res.unpack()[0])
+        except Exception as e:
+            log(f"idle: logind would not let us delay sleep ({e})")
+
+    def release(self):
+        if self.inhibitor is not None:
+            os.close(self.inhibitor)
+            self.inhibitor = None
+        return False
+
+    def on_prepare_for_sleep(self, _c, _s, _p, _i, _n, params):
+        going = params.unpack()[0]
+        if not going:                               # woke up
+            self.set_screens(True)
+            self.inhibit()
+            return
+        if self.paused or is_locked():
+            self.release()
+            return
+        self.lock_now()
+        started = time.monotonic()
+
+        def wait():
+            # sleep once the lock screen is up, or after 3 seconds anyway
+            if is_locked() or time.monotonic() - started > 3:
+                self.GLib.timeout_add(150, self.release)   # one frame for the compositor
+                return False
+            return True
+
+        self.GLib.timeout_add(50, wait)
+
+    # ---- pause
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        if self.paused:
+            open(PAUSED_FILE, "w").close()
+        else:
+            try:
+                os.unlink(PAUSED_FILE)
+            except FileNotFoundError:
+                pass
+        self.arm()
+        log("idle: paused" if self.paused else "idle: resumed")
+        return True
+
+    # ---- loop
+
+    def run(self):
+        GLib = self.GLib
+        loop = GLib.MainLoop()
+
+        def on_wayland(_fd, cond):
+            if cond & (GLib.IOCondition.HUP | GLib.IOCondition.ERR) or not self.wl.read():
+                loop.quit()
+                return False
+            return True
+
+        try:
+            gi_require("GLibUnix", "2.0")
+            from gi.repository import GLibUnix
+            fd_add, signal_add = GLibUnix.fd_add_full, GLibUnix.signal_add
+        except (ValueError, ImportError):
+            fd_add, signal_add = GLib.unix_fd_add_full, GLib.unix_signal_add
+        fd_add(GLib.PRIORITY_DEFAULT, self.wl.sock.fileno(),
+               GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, on_wayland)
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.toggle_pause)
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, self.on_locked)
+        for s in (signal.SIGTERM, signal.SIGINT):
+            signal_add(GLib.PRIORITY_DEFAULT, s, lambda: loop.quit() or False)
+        self.setup_logind()
+        loop.run()
+        # screens back on before going; never wait long for that
+        self.set_screens(True)
+        try:
+            self.wl.roundtrip(timeout=1)
+        except (SystemExit, OSError):
+            pass
+
+
+def idle_command(args):
+    sub = args[0] if args else ""
+    if sub in ("pause", "resume", "toggle", "status"):
+        pid = idle_daemon_pid()
+        paused = os.path.exists(PAUSED_FILE)
+        if sub == "status":
+            print("not running" if not pid else ("paused" if paused else "active"))
+            return 0
+        if not pid:
+            print("locklet: the idle daemon is not running (locklet idle)", file=sys.stderr)
+            return 1
+        if sub == "toggle" or (sub == "pause") != paused:
+            os.kill(pid, signal.SIGUSR1)
+        return 0
+    if sub:
+        print(f"locklet: unknown idle command {sub!r} (see locklet --help)", file=sys.stderr)
+        return 2
+    # a new daemon replaces the one running (to pick up a changed config)
+    old = idle_daemon_pid()
+    if old:
+        os.kill(old, signal.SIGTERM)
+    held = None
+    for _ in range(40):
+        held = hold(IDLE_FILE)
+        if held:
+            break
+        time.sleep(0.05)
+    if not held:
+        print("locklet: another idle daemon would not stop", file=sys.stderr)
+        return 1
+    cfg = dict(IDLE_DEFAULTS)
+    cfg.update(load_config().get("idle") or {})
+    try:
+        import gi
+        gi.require_version("GLib", "2.0")
+        IdleDaemon(cfg).run()
+    except ConnectionError as e:
+        log(f"idle: cannot connect to the compositor: {e}")
+        return 1
+    return 0
+
+
+def tell_idle_daemon_locked():
+    pid = idle_daemon_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGUSR2)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Arguments, before GTK is loaded
+
+def usage():
+    print(__doc__.strip())
+
+
+ARGS = sys.argv[1:]
+if any(a in ("-h", "--help", "help") for a in ARGS):
+    usage()
+    sys.exit(0)
+if ARGS[:1] == ["idle"]:
+    sys.exit(idle_command(ARGS[1:]))
+PREVIEW = "--preview" in ARGS
+unknown = [a for a in ARGS if a != "--preview"]
+if unknown:
+    print(f"locklet: unknown argument {unknown[0]!r} (see locklet --help)", file=sys.stderr)
+    sys.exit(2)
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
+
+# gtk4-layer-shell (which has the session lock too) has to be loaded before
+# libwayland-client, which gi pulls in.
+try:
+    ctypes.CDLL("libgtk4-layer-shell.so.0")
+except OSError:
+    ctypes.CDLL("libgtk4-layer-shell.so")
+
+import gi  # noqa: E402
+
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Graphene", "1.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("Gtk4SessionLock", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as Layer  # noqa: E402
+from gi.repository import Gtk4SessionLock as SessionLock  # noqa: E402
+
+CSS = """
+window.locklet { background-color: #11111b; }
+
+.locklet {
+  font-family: "Inter", sans-serif;
+  color: #cdd6f4;
+}
+/* darker towards the bottom, where the text is */
+.locklet .shade {
+  background-image: linear-gradient(to bottom, rgba(17,17,27,0.10) 0%, rgba(17,17,27,0) 35%,
+                                               rgba(17,17,27,0) 55%, rgba(17,17,27,0.45) 100%);
+}
+
+.locklet .top, .locklet .form {
+  opacity: 0;
+  transition: opacity 420ms ease-out, transform 620ms cubic-bezier(0.2, 0.9, 0.25, 1.0);
+}
+.locklet .top  { transform: translateY(-24px); }
+.locklet .form { transform: translateY(30px); transition-delay: 60ms; }
+.locklet.shown .top, .locklet.shown .form { opacity: 1; transform: none; }
+.locklet.leaving .top, .locklet.leaving .form {
+  opacity: 0; transform: scale(0.97);
+  transition: opacity 200ms ease-in, transform 220ms ease-in;
+}
+
+.locklet .date {
+  font-size: 22px; font-weight: 500;
+  color: rgba(205, 214, 244, 0.86);
+  text-shadow: 0 1px 8px rgba(0,0,0,0.35);
+}
+.locklet .clock {
+  font-family: "Inter Display", "Inter", sans-serif;
+  font-size: 128px; font-weight: 600;
+  font-feature-settings: "tnum";
+  letter-spacing: -3px;
+  color: rgba(239, 241, 251, 0.94);
+  text-shadow: 0 2px 24px rgba(0,0,0,0.30);
+  margin-top: -8px;
+}
+.locklet.small .clock { font-size: 88px; }
+.locklet.small .date  { font-size: 18px; }
+
+.locklet .avatar { margin-bottom: 12px; }
+.locklet .name {
+  font-size: 17px; font-weight: 600;
+  color: #eff1fb;
+  text-shadow: 0 1px 6px rgba(0,0,0,0.4);
+  margin-bottom: 14px;
+}
+
+.locklet .pill {
+  min-width: 260px;
+  background-color: rgba(205, 214, 244, 0.13);
+  border: 1px solid rgba(205, 214, 244, 0.18);
+  border-radius: 99px;
+  padding: 3px 3px 3px 16px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+.locklet .pill:focus-within {
+  background-color: rgba(205, 214, 244, 0.17);
+  border-color: rgba(203, 166, 247, 0.55);
+}
+.locklet .pill.error { border-color: rgba(243, 139, 168, 0.75); }
+.locklet .pill.shake { animation: locklet-shake 460ms cubic-bezier(0.36, 0.07, 0.19, 0.97); }
+@keyframes locklet-shake {
+  0%   { transform: translateX(0); }
+  15%  { transform: translateX(-14px); }
+  30%  { transform: translateX(12px); }
+  45%  { transform: translateX(-9px); }
+  60%  { transform: translateX(6px); }
+  75%  { transform: translateX(-3px); }
+  100% { transform: translateX(0); }
+}
+
+.locklet .pill entry.password, .locklet .pill entry.password > text {
+  all: unset;
+  font-size: 15px;
+  color: #eff1fb;
+  caret-color: #cba6f7;
+}
+.locklet .pill entry.password > text > placeholder { color: rgba(205, 214, 244, 0.55); }
+.locklet .pill entry.password > image { color: rgba(205, 214, 244, 0.6); margin-left: 6px; }
+.locklet .pill entry.password > text > selection { background-color: rgba(203, 166, 247, 0.4); }
+
+.locklet .pill button.go {
+  all: unset;
+  min-width: 34px; min-height: 34px;
+  border-radius: 99px;
+  margin-left: 6px;
+  background-color: rgba(205, 214, 244, 0.16);
+  color: #eff1fb;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+.locklet .pill button.go:hover { background-color: #cba6f7; color: #1e1e2e; }
+.locklet .pill button.go.ready { background-color: #cba6f7; color: #1e1e2e; }
+.locklet .pill button.go .icon {
+  font-family: "Material Symbols Rounded";
+  font-size: 20px;
+}
+.locklet .pill spinner { color: #eff1fb; margin: 8px; }
+
+.locklet .status {
+  font-size: 13px; font-weight: 500;
+  margin-top: 12px;
+  min-height: 18px;
+  color: rgba(205, 214, 244, 0.75);
+  text-shadow: 0 1px 6px rgba(0,0,0,0.45);
+}
+.locklet .status.error { color: #f5a3b8; }
+.locklet .hint {
+  font-size: 12px;
+  color: rgba(205, 214, 244, 0.45);
+  margin-top: 26px;
+}
+"""
+
+ACCENT = (0.796, 0.651, 0.969)      # #cba6f7
+
+
+def ease(t):
+    t = min(1.0, max(0.0, t))
+    return 1 - (1 - t) ** 3
+
+
+class Backdrop(Gtk.Widget):
+    """The picture behind the lock screen: the screenshot it starts from,
+    the blurred background crossfading in over it, a slow drift, and the
+    screenshot again when unlocking."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.shot = None            # Gdk.Texture, the screen as it was
+        self.bg = None              # Gdk.Texture, blurred
+        self.bg_since = None
+        self.leave_since = None
+        self.blur_fallback = 0      # px, when the blur is done by GTK
+        self.dim = float(cfg["dim"])
+        self.drift = bool(cfg["drift"])
+        self.period = 1e6 / max(1, int(cfg.get("fps") or 30))
+        self.color = Gdk.RGBA()
+        self.color.parse("#11111b")
+        self.last_frame = 0
+        self.t0 = time.monotonic()
+        self.add_tick_callback(self.on_tick)
+
+    def set_background(self, texture, blur_fallback=0):
+        self.bg = texture
+        self.blur_fallback = blur_fallback
+        # without a screenshot under it, appear from the plain colour
+        self.bg_since = time.monotonic()
+        self.queue_draw()
+
+    def leave(self):
+        self.leave_since = time.monotonic()
+        self.queue_draw()
+
+    def animating(self, now):
+        return (self.drift and self.bg is not None) \
+            or (self.bg_since is not None and now - self.bg_since < 1.0) \
+            or self.leave_since is not None
+
+    def on_tick(self, _w, clock):
+        now_us = clock.get_frame_time()
+        if self.animating(time.monotonic()):
+            # the drift moves a fraction of a pixel a frame: fps is plenty
+            transitioning = (self.bg_since and time.monotonic() - self.bg_since < 1.0) or self.leave_since
+            if transitioning or now_us - self.last_frame >= self.period:
+                self.last_frame = now_us
+                self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def cover(self, snapshot, tex, w, h, zoom=1.0, dx=0.0, dy=0.0):
+        tw, th = tex.get_width(), tex.get_height()
+        s = max(w / tw, h / th) * zoom
+        rw, rh = tw * s, th * s
+        rect = Graphene.Rect().init((w - rw) / 2 + dx, (h - rh) / 2 + dy, rw, rh)
+        snapshot.append_texture(tex, rect)
+
+    def do_snapshot(self, snapshot):
+        w, h = self.get_width(), self.get_height()
+        full = Graphene.Rect().init(0, 0, w, h)
+        now = time.monotonic()
+        snapshot.append_color(self.color, full)
+        if self.shot is not None:
+            self.cover(snapshot, self.shot, w, h)
+        if self.bg is not None:
+            a = ease((now - self.bg_since) / 0.9) if self.bg_since else 1.0
+            snapshot.push_clip(full)
+            snapshot.push_opacity(a)
+            if self.drift:
+                t = now - self.t0
+                zoom = 1.08 + 0.025 * math.sin(2 * math.pi * t / 47)
+                dx = 0.016 * w * math.sin(2 * math.pi * t / 61 + 1.0)
+                dy = 0.012 * h * math.cos(2 * math.pi * t / 53)
+            else:
+                zoom, dx, dy = 1.06 if self.blur_fallback else 1.0, 0.0, 0.0
+            if self.blur_fallback:
+                snapshot.push_blur(self.blur_fallback)
+            self.cover(snapshot, self.bg, w, h, zoom, dx, dy)
+            if self.blur_fallback:
+                snapshot.pop()
+            dim = Gdk.RGBA()
+            dim.red, dim.green, dim.blue, dim.alpha = 0.067, 0.067, 0.106, self.dim
+            snapshot.append_color(dim, full)
+            snapshot.pop()
+            snapshot.pop()
+        if self.leave_since is not None and self.shot is not None:
+            snapshot.push_opacity(ease((now - self.leave_since) / 0.32))
+            self.cover(snapshot, self.shot, w, h)
+            snapshot.pop()
+
+
+class Avatar(Gtk.DrawingArea):
+    def __init__(self, path, name, size=96):
+        super().__init__()
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.add_css_class("avatar")
+        self.set_halign(Gtk.Align.CENTER)
+        self.pixbuf = None
+        if path:
+            try:
+                self.pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, size * 2, size * 2, True)
+            except GLib.Error:
+                pass
+        self.initial = (name.strip()[:1] or "?").upper()
+        self.set_draw_func(self.draw)
+
+    def draw(self, _area, cr, w, h):
+        r = min(w, h) / 2
+        cx, cy = w / 2, h / 2
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.clip()
+        if self.pixbuf is not None:
+            pw, ph = self.pixbuf.get_width(), self.pixbuf.get_height()
+            s = max(w / pw, h / ph)
+            cr.translate(cx - pw * s / 2, cy - ph * s / 2)
+            cr.scale(s, s)
+            Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
+            cr.paint()
+            cr.identity_matrix()
+        else:
+            import cairo
+            g = cairo.LinearGradient(0, 0, w, h)
+            g.add_color_stop_rgb(0, *ACCENT)
+            g.add_color_stop_rgb(1, 0.537, 0.706, 0.980)      # #89b4fa
+            cr.set_source(g)
+            cr.paint()
+            cr.set_source_rgba(0.118, 0.118, 0.180, 0.92)    # #1e1e2e
+            cr.select_font_face("Inter", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(r * 0.95)
+            ext = cr.text_extents(self.initial)
+            cr.move_to(cx - ext.width / 2 - ext.x_bearing, cy - ext.height / 2 - ext.y_bearing)
+            cr.show_text(self.initial)
+        # a thin light ring
+        cr.reset_clip()
+        cr.new_path()
+        cr.arc(cx, cy, r - 0.75, 0, 2 * math.pi)
+        cr.set_source_rgba(1, 1, 1, 0.22)
+        cr.set_line_width(1.5)
+        cr.stroke()
+
+
+class LockView(Gtk.Overlay):
+    """What one output shows."""
+
+    def __init__(self, app, monitor):
+        super().__init__()
+        self.app = app
+        cfg = app.cfg
+        self.add_css_class("locklet")
+        geo = monitor.get_geometry() if monitor else None
+        if geo is not None and geo.height < 820:
+            self.add_css_class("small")
+
+        self.backdrop = Backdrop(cfg)
+        self.set_child(self.backdrop)
+        shade = Gtk.Box()
+        shade.add_css_class("shade")
+        shade.set_can_target(False)
+        self.add_overlay(shade)
+
+        # the date and the clock, high up
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        top.add_css_class("top")
+        top.set_halign(Gtk.Align.CENTER)
+        top.set_valign(Gtk.Align.START)
+        top.set_margin_top(int((geo.height if geo else 1080) * 0.10))
+        self.date = Gtk.Label(css_classes=["date"])
+        self.clock = Gtk.Label(css_classes=["clock"])
+        top.append(self.date)
+        top.append(self.clock)
+        top.set_can_target(False)
+        self.add_overlay(top)
+
+        # the user and the password, low down
+        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        form.add_css_class("form")
+        form.set_halign(Gtk.Align.CENTER)
+        form.set_valign(Gtk.Align.END)
+        form.set_margin_bottom(int((geo.height if geo else 1080) * 0.12))
+        form.append(Avatar(app.avatar, app.name))
+        form.append(Gtk.Label(label=app.name, css_classes=["name"]))
+
+        self.pill = Gtk.Box(css_classes=["pill"])
+        self.pill.set_halign(Gtk.Align.CENTER)
+        self.entry = Gtk.PasswordEntry()
+        self.entry.set_hexpand(True)
+        self.entry.set_valign(Gtk.Align.CENTER)
+        self.entry.set_property("placeholder-text", "Enter Password")
+        self.entry.set_show_peek_icon(True)
+        self.entry.connect("activate", lambda _e: self.submit())
+        self.entry.connect("changed", self.on_changed)
+        self.pill.append(self.entry)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(120)
+        self.go = Gtk.Button(css_classes=["go"])
+        self.go.set_child(Gtk.Label(label="arrow_forward", css_classes=["icon"]))
+        self.go.set_focusable(False)
+        self.go.connect("clicked", lambda _b: self.submit())
+        self.spinner = Gtk.Spinner()
+        self.stack.add_named(self.go, "go")
+        self.stack.add_named(self.spinner, "busy")
+        self.pill.append(self.stack)
+        form.append(self.pill)
+
+        self.status = Gtk.Label(css_classes=["status"])
+        form.append(self.status)
+        if app.preview:
+            form.append(Gtk.Label(label="preview: Esc closes", css_classes=["hint"]))
+        self.add_overlay(form)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+        # a click anywhere gives the field the focus back
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda *_: self.entry.grab_focus())
+        self.add_controller(click)
+
+        self.error = ""
+        self.tick_clock()
+        self.connect("map", self.on_map)
+
+    def on_map(self, _w):
+        self.entry.grab_focus()
+        GLib.timeout_add(30, lambda: self.add_css_class("shown") or False)
+
+    def tick_clock(self):
+        now = time.localtime()
+        self.clock.set_label(time.strftime(self.app.cfg["clock"], now))
+        self.date.set_label(time.strftime(self.app.cfg["date"], now))
+
+    def on_changed(self, _e):
+        has = bool(self.entry.get_text())
+        (self.go.add_css_class if has else self.go.remove_css_class)("ready")
+        if has and self.error:
+            self.app.set_status("")
+
+    def on_key(self, _c, keyval, _code, _state):
+        if keyval == Gdk.KEY_Escape:
+            if self.app.preview and not self.entry.get_text():
+                self.app.quit()
+            self.entry.set_text("")
+            return True
+        if not self.entry.has_focus() and self.entry.get_sensitive():
+            self.entry.grab_focus()
+        return False
+
+    def submit(self):
+        self.app.submit(self.entry.get_text())
+
+    def set_busy(self, busy):
+        self.entry.set_sensitive(not busy)
+        self.stack.set_visible_child_name("busy" if busy else "go")
+        self.spinner.set_spinning(busy)
+        if not busy:
+            self.entry.grab_focus()
+
+    def show_status(self, text, error=False):
+        self.error = text if error else ""
+        self.status.set_label(text)
+        (self.status.add_css_class if error else self.status.remove_css_class)("error")
+        (self.pill.add_css_class if error else self.pill.remove_css_class)("error")
+
+    def shake(self):
+        self.entry.set_text("")
+        self.pill.remove_css_class("shake")
+        GLib.idle_add(lambda: self.pill.add_css_class("shake") or False)
+        GLib.timeout_add(500, lambda: self.pill.remove_css_class("shake") or False)
+
+    def leave(self):
+        self.add_css_class("leaving")
+        self.backdrop.leave()
+
+
+class Locklet(Gtk.Application):
+    def __init__(self, preview):
+        super().__init__(application_id="io.github.prietus.locklet" + (".preview" if preview else ""),
+                         flags=gi.repository.Gio.ApplicationFlags.NON_UNIQUE)
+        self.preview = preview
+        self.cfg = load_config()
+        self.user = pwd.getpwuid(os.getuid()).pw_name
+        self.name = display_name(self.cfg)
+        self.avatar = find_avatar(self.cfg)
+        self.service = pam_service(self.cfg)
+        self.views = []
+        self.shots = {}
+        self.wallpapers = {}
+        self.checking = False
+        self.unlocking = False
+        self.lock = None
+        self.pool = ThreadPoolExecutor(max_workers=4)
+
+    # ---- setup
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        user_css = os.path.join(CONFIG_DIR, "style.css")
+        if os.path.exists(user_css):
+            mine = Gtk.CssProvider()
+            mine.load_from_path(user_css)
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), mine,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+    def do_activate(self):
+        self.hold()
+        display = Gdk.Display.get_default()
+        monitors = [display.get_monitors().get_item(i) for i in range(display.get_monitors().get_n_items())]
+        bg = str(self.cfg["background"])
+        want_shots = (self.cfg["fade"] or bg == "screenshot") and shutil.which("grim")
+        # the screen as it is, before it is covered
+        if want_shots:
+            names = [m.get_connector() for m in monitors]
+            for name, png in zip(names, self.pool.map(screenshot, names)):
+                if png:
+                    self.shots[name] = png
+        if bg == "wallpaper":
+            self.wallpapers = bgmonad_wallpapers()
+        GLib.timeout_add_seconds(1, self.tick)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.on_usr1)
+
+        if self.preview:
+            win = self.make_window(monitors[0] if monitors else None)
+            Layer.init_for_window(win)
+            Layer.set_layer(win, Layer.Layer.OVERLAY)
+            Layer.set_keyboard_mode(win, Layer.KeyboardMode.EXCLUSIVE)
+            Layer.set_exclusive_zone(win, -1)
+            for edge in (Layer.Edge.TOP, Layer.Edge.BOTTOM, Layer.Edge.LEFT, Layer.Edge.RIGHT):
+                Layer.set_anchor(win, edge, True)
+            if monitors:
+                Layer.set_monitor(win, monitors[0])
+            win.present()
+            return
+
+        if not SessionLock.is_supported():
+            log("the compositor does not support ext-session-lock-v1")
+            self.quit()
+            sys.exit(1)
+        self.lock = SessionLock.Instance.new()
+        self.lock.connect("monitor", self.on_monitor)
+        self.lock.connect("failed", self.on_failed)
+        self.lock.connect("locked", self.on_locked)
+        self.lock.connect("unlocked", lambda _l: self.quit())
+        self.lock.lock()
+
+    def on_monitor(self, lock, monitor):
+        win = self.make_window(monitor)
+        lock.assign_window_to_monitor(win, monitor)
+
+    def on_locked(self, _lock):
+        with open(LOCKED_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        tell_idle_daemon_locked()
+
+    def on_failed(self, _lock):
+        log("could not lock the session (is it locked already?)")
+        self.quit()
+
+    def make_window(self, monitor):
+        win = Gtk.Window(application=self)
+        win.add_css_class("locklet")
+        view = LockView(self, monitor)
+        win.set_child(view)
+        self.views.append(view)
+        win.connect("destroy", lambda _w: self.views.remove(view) if view in self.views else None)
+        self.load_background(view, monitor)
+        return win
+
+    def load_background(self, view, monitor):
+        name = monitor.get_connector() if monitor else None
+        shot = self.shots.get(name)
+        if shot:
+            try:
+                view.backdrop.shot = Gdk.Texture.new_from_bytes(GLib.Bytes.new(shot))
+            except GLib.Error:
+                pass
+        bg = str(self.cfg["background"])
+        if bg.startswith("#"):
+            color = Gdk.RGBA()
+            if color.parse(bg):
+                view.backdrop.color = color
+                view.backdrop.dim = 0
+            view.backdrop.drift = False
+            view.backdrop.set_background(None)
+            return
+        if bg == "screenshot":
+            source = shot
+        elif bg == "wallpaper":
+            source = self.wallpapers.get(name) or os.path.expanduser("~/.config/wallpaper")
+        else:
+            source = os.path.expanduser(bg)
+        if not source or (isinstance(source, str) and not os.path.exists(source)):
+            return
+        geo = monitor.get_geometry() if monitor else None
+        scale = monitor.get_scale() if monitor else 1
+        w = int((geo.width if geo else 1920) * scale)
+        h = int((geo.height if geo else 1080) * scale)
+        blur = float(self.cfg["blur"])
+
+        def done(fut):
+            GLib.idle_add(self.background_ready, view, source, fut.result(), blur, h)
+
+        self.pool.submit(blurred_rgb, source, w, h, blur).add_done_callback(done)
+
+    def background_ready(self, view, source, rgb, blur, h):
+        if rgb is not None:
+            w_, h_, data = rgb
+            tex = Gdk.MemoryTexture.new(w_, h_, Gdk.MemoryFormat.R8G8B8, GLib.Bytes.new(data), w_ * 3)
+            view.backdrop.set_background(tex)
+            return False
+        # no Pillow: let GTK load and blur it (every frame, so no drift)
+        try:
+            tex = Gdk.Texture.new_from_bytes(GLib.Bytes.new(source)) if isinstance(source, bytes) \
+                else Gdk.Texture.new_from_filename(source)
+        except GLib.Error as e:
+            log(f"cannot read the background: {e.message}")
+            return False
+        view.backdrop.drift = False
+        view.backdrop.set_background(tex, blur_fallback=blur * h / max(1, view.get_scale_factor()))
+        return False
+
+    # ---- running
+
+    def tick(self):
+        for v in self.views:
+            v.tick_clock()
+        return GLib.SOURCE_CONTINUE
+
+    def set_status(self, text, error=False):
+        for v in self.views:
+            v.show_status(text, error)
+
+    def submit(self, password):
+        if self.checking or self.unlocking:
+            return
+        if not password:
+            for v in self.views:
+                v.shake()
+            return
+        self.checking = True
+        for v in self.views:
+            v.set_busy(True)
+        self.set_status("")
+
+        def check():
+            try:
+                ok, why = authenticate(self.service, self.user, password)
+            except Exception as e:      # never stay stuck in "checking"
+                ok, why = False, f"PAM error: {e}"
+            GLib.idle_add(self.checked, ok, why)
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def checked(self, ok, why):
+        self.checking = False
+        if ok:
+            self.unlock()
+            return False
+        for v in self.views:
+            v.set_busy(False)
+            v.shake()
+        self.set_status(why or "Wrong password", error=True)
+        return False
+
+    def on_usr1(self):
+        self.unlock()
+        return GLib.SOURCE_CONTINUE
+
+    def unlock(self):
+        if self.unlocking:
+            return
+        self.unlocking = True
+        for v in self.views:
+            v.leave()
+        GLib.timeout_add(340, self.finish)
+
+    def finish(self):
+        if self.lock is not None:
+            self.lock.unlock()       # "unlocked" quits
+        else:
+            self.quit()
+        return False
+
+
+def main():
+    held = None
+    if not PREVIEW:
+        held = hold(LOCK_FILE)
+        if held is None:
+            log("already locked")
+            return 0
+    app = Locklet(PREVIEW)
+    code = app.run([sys.argv[0]])
+    app.pool.shutdown(wait=False, cancel_futures=True)
+    if read_pid(LOCKED_FILE) == os.getpid():
+        os.unlink(LOCKED_FILE)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
