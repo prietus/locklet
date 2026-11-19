@@ -100,7 +100,9 @@ Any key or the mouse turns the screens back on.
 
 ## Settings
 
-`~/.config/locklet/config.json`, every key optional:
+`~/.config/locklet/config.json`, every key optional (all of them with their
+default values are in [examples/config.json](examples/config.json): copy it and
+edit it):
 
 ```json
 {

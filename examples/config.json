@@ -1,0 +1,20 @@
+{
+  "background": "wallpaper",
+  "blur": 0.025,
+  "dim": 0.38,
+  "drift": true,
+  "fps": 30,
+  "fade": true,
+  "clock": "%H:%M",
+  "date": "%A, %-d %B",
+  "avatar": "",
+  "name": "",
+  "pam_service": "",
+
+  "idle": {
+    "lock": "10m",
+    "screen_off": 0,
+    "screen_off_locked": 0,
+    "lock_before_sleep": true
+  }
+}
