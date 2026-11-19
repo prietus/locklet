@@ -20,6 +20,12 @@ in the family of [shotlet](https://github.com/prietus/shotlet),
 - `locklet idle` locks after 10 minutes without input and before
   suspending, and can turn the screens off: no swayidle needed.
 
+![locklet: the date and the clock over bgmonad's wallpaper, blurred and darkened, with the avatar, the name and the password field below](docs/screenshot.png)
+
+*The lock screen over the wallpaper that
+[bgmonad](https://github.com/prietus/bgmonad) shows on the desktop, blurred
+and darkened; it drifts slowly while locked.*
+
 It is one Python file (GTK 4 and gtk4-layer-shell's session lock); the
 password is checked with PAM through ctypes.
 
