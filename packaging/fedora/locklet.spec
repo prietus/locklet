@@ -24,9 +24,10 @@ Recommends:     bgmonad
 %description
 locklet is a lock screen for river and rivermonad (or any compositor with
 ext-session-lock-v1). The screen keeps looking the same for an instant and
-then crossfades to the wallpaper bgmonad shows on that output, blurred and
-darkened, drifting slowly. The password is checked with PAM. It also has an
-idle daemon that locks after a while without input and before suspending.
+then crossfades to the wallpaper bgmonad shows on that output, blurred,
+darkened and flowing slowly, with what is playing (MPRIS) under the clock.
+The password is checked with PAM. It also has an idle daemon that locks
+after a while without input and before suspending.
 
 
 %prep

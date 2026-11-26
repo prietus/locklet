@@ -8,7 +8,7 @@ url='https://github.com/prietus/locklet'
 arch=('any')
 license=('BSD-3-Clause')
 depends=('python' 'python-gobject' 'gtk4' 'gtk4-layer-shell' 'pam')
-optdepends=('python-pillow: blurred background with the slow drift (else GTK blurs it, without drift)'
+optdepends=('python-pillow: blurred background that flows slowly (else GTK blurs it, still)'
             'grim: start from the screen as it was and crossfade'
             'bgmonad: the same wallpaper as the desktop on every output')
 backup=('etc/pam.d/locklet')

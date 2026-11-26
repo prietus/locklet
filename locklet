@@ -12,9 +12,10 @@ ext-session-lock-v1), in the family of shotlet, waymobar and bgmonad.
 
 The screen keeps looking the same for an instant (a screenshot taken just
 before locking) and then crossfades to the wallpaper bgmonad shows on that
-output, blurred and darkened, drifting slowly. The password is checked with
-PAM. Killing locklet does not unlock: the compositor keeps the session
-locked until a new locklet unlocks it. SIGUSR1 unlocks (for scripts).
+output, blurred, darkened and flowing slowly, with what is playing under the
+clock. The password is checked with PAM. Killing locklet does not unlock:
+the compositor keeps the session locked until a new locklet unlocks it.
+SIGUSR1 unlocks (for scripts).
 
 Settings: ~/.config/locklet/config.json; ~/.config/locklet/style.css is
 loaded after the built-in style (GTK CSS) to restyle it.
@@ -48,9 +49,14 @@ DEFAULTS = {
     "background": "wallpaper",
     "blur": 0.025,          # blur radius, as a fraction of the screen height (0 = sharp)
     "dim": 0.38,            # 0 = the picture as it is, 1 = black
-    "drift": True,          # a slow zoom and pan, like bgmonad's drift
-    "fps": 30,              # of the drift
+    # "flow": the picture flows slowly, like bgmonad's; "drift": a slow zoom
+    # and pan; "none": still
+    "animation": "flow",
+    "flow": 0.07,           # how far the flow moves the picture, in screen heights
+    "flow_speed": 1.0,      # 1 = a swirl takes 10 to 30 seconds
+    "fps": 20,              # of the animation (it is drawn only while the screen is on)
     "fade": True,           # start from a screenshot and crossfade (needs grim)
+    "music": True,          # what is playing (MPRIS), with previous / play-pause / next
     "clock": "%H:%M",
     "date": "%A, %-d %B",
     "avatar": "",           # an image; else ~/.face, AccountsService, the initial
@@ -61,13 +67,21 @@ DEFAULTS = {
 
 def load_config():
     cfg = dict(DEFAULTS)
+    mine = {}
     try:
         with open(os.path.join(CONFIG_DIR, "config.json")) as f:
-            cfg.update(json.load(f))
+            mine = json.load(f)
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as e:
         print(f"locklet: config.json: {e}", file=sys.stderr)
+    # 0.1.0 had "drift": true / false instead of "animation"
+    if "drift" in mine and "animation" not in mine:
+        mine["animation"] = "drift" if mine["drift"] else "none"
+    cfg.update(mine)
+    if cfg["animation"] not in ("flow", "drift", "none"):
+        print(f"locklet: unknown animation {cfg['animation']!r}, using \"flow\"", file=sys.stderr)
+        cfg["animation"] = "flow"
     return cfg
 
 
@@ -239,6 +253,80 @@ def blurred_rgb(source, width, height, blur):
     if blur > 0:
         im = im.filter(ImageFilter.GaussianBlur(blur * th))
     return im.width, im.height, im.tobytes()
+
+
+class FlowField:
+    """bgmonad's flow, for a blurred picture: a sum of slow shear waves
+    travelling in different directions (periods that share no factor, so
+    it never repeats), evaluated on a coarse grid; Pillow warps the picture
+    through the grid (in C). Blurred, the picture can be warped at an
+    eighth of the screen's resolution and scaled up by the GPU: about 2 ms
+    a frame."""
+
+    # (direction in turns, waves per screen height, period in seconds, weight, phase)
+    WAVES = [(0.07, 0.55, 29, 1.00, 0.0), (0.31, 0.85, 19, 0.75, 1.3),
+             (0.58, 1.30, 13, 0.50, 2.9), (0.83, 1.90, 11, 0.30, 4.1)]
+
+    def __init__(self, image, width, height, margin, amount, speed):
+        from PIL import Image
+        self.Image = Image
+        self.image, self.width, self.height, self.margin = image, width, height, margin
+        self.speed = speed
+        total = sum(w for *_, w, _ph in self.WAVES)
+        self.waves = [(math.cos(2 * math.pi * a), math.sin(2 * math.pi * a), 2 * math.pi * f,
+                       amount * w / total, p, ph) for a, f, p, w, ph in self.WAVES]
+        self.gx = 16
+        self.gy = max(4, round(16 * height / max(1, width)))
+        self.boxes = [(round(i * width / self.gx), round(j * height / self.gy),
+                       round((i + 1) * width / self.gx), round((j + 1) * height / self.gy))
+                      for j in range(self.gy) for i in range(self.gx)]
+
+    def frame(self, t):
+        """RGB bytes, width x height, of the picture at time t (seconds)."""
+        W, H, m, gx, gy = self.width, self.height, self.margin, self.gx, self.gy
+        t *= self.speed
+        node = {}
+        for j in range(gy + 1):
+            for i in range(gx + 1):
+                x, y = i / gx * W / H, j / gy           # in screen heights
+                dx = dy = 0.0
+                for nx, ny, k, amp, period, ph in self.waves:
+                    s = amp * math.sin(k * (x * nx + y * ny) + 2 * math.pi * t / period + ph)
+                    dx -= ny * s                         # across the wave: nothing is squeezed
+                    dy += nx * s
+                node[i, j] = (m + i / gx * W + dx * H, m + j / gy * H + dy * H)
+        mesh = []
+        for n, box in enumerate(self.boxes):
+            i, j = n % gx, n // gx
+            a, b, c, d = node[i, j], node[i, j + 1], node[i + 1, j + 1], node[i + 1, j]
+            mesh.append((box, (*a, *b, *c, *d)))
+        return self.image.transform((W, H), self.Image.Transform.MESH, mesh,
+                                    self.Image.Resampling.BILINEAR).tobytes()
+
+
+def prepare_flow(source, width, height, blur, amount, speed):
+    """A FlowField for the picture covering width x height, or None (no
+    Pillow, or the picture cannot be read)."""
+    try:
+        import io
+        from PIL import Image, ImageFilter, ImageOps
+    except ImportError:
+        return None
+    try:
+        im = Image.open(io.BytesIO(source) if isinstance(source, bytes) else source)
+        im = ImageOps.exif_transpose(im).convert("RGB")
+    except Exception as e:
+        log(f"cannot read the background: {e}")
+        return None
+    # blurred, an eighth of the resolution is plenty; sharp, a half
+    k = 1 / 8 if blur >= 0.01 else 1 / 2
+    W, H = max(16, int(width * k)), max(9, int(height * k))
+    amount = min(max(0.0, float(amount)), 0.08)
+    m = int(amount * H) + 3                              # room for the waves at the edges
+    im = ImageOps.fit(im, (W + 2 * m, H + 2 * m), Image.Resampling.LANCZOS)
+    if blur > 0:
+        im = im.filter(ImageFilter.GaussianBlur(blur * H))
+    return FlowField(im, W, H, m, amount, float(speed))
 
 
 def find_avatar(cfg):
@@ -730,7 +818,7 @@ gi.require_version("Graphene", "1.0")
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
 gi.require_version("Gtk4SessionLock", "1.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gtk, Pango  # noqa: E402
 from gi.repository import Gtk4LayerShell as Layer  # noqa: E402
 from gi.repository import Gtk4SessionLock as SessionLock  # noqa: E402
 
@@ -762,7 +850,8 @@ window.locklet { background-color: #11111b; }
 .locklet .date {
   font-size: 22px; font-weight: 500;
   color: rgba(205, 214, 244, 0.86);
-  text-shadow: 0 1px 8px rgba(0,0,0,0.35);
+  /* no text-shadow: over a moving background GTK's GL renderer draws it
+     as dark boxes */
 }
 .locklet .clock {
   font-family: "Inter Display", "Inter", sans-serif;
@@ -770,7 +859,6 @@ window.locklet { background-color: #11111b; }
   font-feature-settings: "tnum";
   letter-spacing: -3px;
   color: rgba(239, 241, 251, 0.94);
-  text-shadow: 0 2px 24px rgba(0,0,0,0.30);
   margin-top: -8px;
 }
 .locklet.small .clock { font-size: 88px; }
@@ -780,7 +868,6 @@ window.locklet { background-color: #11111b; }
 .locklet .name {
   font-size: 17px; font-weight: 600;
   color: #eff1fb;
-  text-shadow: 0 1px 6px rgba(0,0,0,0.4);
   margin-bottom: 14px;
 }
 
@@ -841,7 +928,6 @@ window.locklet { background-color: #11111b; }
   margin-top: 12px;
   min-height: 18px;
   color: rgba(205, 214, 244, 0.75);
-  text-shadow: 0 1px 6px rgba(0,0,0,0.45);
 }
 .locklet .status.error { color: #f5a3b8; }
 .locklet .hint {
@@ -849,6 +935,47 @@ window.locklet { background-color: #11111b; }
   color: rgba(205, 214, 244, 0.45);
   margin-top: 26px;
 }
+
+/* what is playing, under the clock */
+.locklet .media {
+  margin-top: 30px;
+  min-width: 360px;
+  padding: 12px 14px 12px 12px;
+  background-color: rgba(205, 214, 244, 0.10);
+  border: 1px solid rgba(205, 214, 244, 0.14);
+  border-radius: 22px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.22);
+}
+.locklet .media .art {
+  min-width: 64px; min-height: 64px;
+  border-radius: 13px;
+  background-color: rgba(205, 214, 244, 0.12);
+}
+.locklet .media .art .icon {
+  font-family: "Material Symbols Rounded";
+  font-size: 30px;
+  color: rgba(205, 214, 244, 0.55);
+}
+.locklet .media .title { font-size: 15px; font-weight: 600; color: #eff1fb; }
+.locklet .media .artist { font-size: 13px; color: rgba(205, 214, 244, 0.70); margin-top: 1px; }
+.locklet .media .player { font-size: 11px; font-weight: 600; color: rgba(205, 214, 244, 0.45); margin-bottom: 2px; }
+.locklet .media button {
+  all: unset;
+  min-width: 36px; min-height: 36px;
+  border-radius: 99px;
+  color: #eff1fb;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.locklet .media button:hover { background-color: rgba(205, 214, 244, 0.14); }
+.locklet .media button:active { background-color: rgba(205, 214, 244, 0.22); }
+.locklet .media button:disabled { color: rgba(205, 214, 244, 0.30); }
+.locklet .media button .icon {
+  font-family: "Material Symbols Rounded";
+  font-variation-settings: "FILL" 1;
+  font-size: 24px;
+}
+.locklet .media button.play .icon { font-size: 32px; }
+.locklet.small .media { margin-top: 18px; }
 """
 
 ACCENT = (0.796, 0.651, 0.969)      # #cba6f7
@@ -861,19 +988,22 @@ def ease(t):
 
 class Backdrop(Gtk.Widget):
     """The picture behind the lock screen: the screenshot it starts from,
-    the blurred background crossfading in over it, a slow drift, and the
-    screenshot again when unlocking."""
+    the blurred background crossfading in over it (flowing, drifting or
+    still), and the screenshot again when unlocking. Frames are made only
+    when GTK draws, and GTK draws only when the compositor wants a frame:
+    with the screen off, nothing is computed."""
 
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.shot = None            # Gdk.Texture, the screen as it was
-        self.bg = None              # Gdk.Texture, blurred
+        self.bg = None              # Gdk.Texture, blurred (with flow: the last frame)
+        self.flow = None            # FlowField
         self.bg_since = None
         self.leave_since = None
         self.blur_fallback = 0      # px, when the blur is done by GTK
         self.dim = float(cfg["dim"])
-        self.drift = bool(cfg["drift"])
+        self.animation = cfg["animation"]
         self.period = 1e6 / max(1, int(cfg.get("fps") or 30))
         self.color = Gdk.RGBA()
         self.color.parse("#11111b")
@@ -888,22 +1018,36 @@ class Backdrop(Gtk.Widget):
         self.bg_since = time.monotonic()
         self.queue_draw()
 
+    def set_flow(self, flow):
+        self.flow = flow
+        self.set_background(self.flow_texture())
+
+    def flow_texture(self):
+        f = self.flow
+        data = f.frame(time.monotonic() - self.t0)
+        return Gdk.MemoryTexture.new(f.width, f.height, Gdk.MemoryFormat.R8G8B8,
+                                     GLib.Bytes.new(data), f.width * 3)
+
     def leave(self):
         self.leave_since = time.monotonic()
         self.queue_draw()
 
     def animating(self, now):
-        return (self.drift and self.bg is not None) \
+        moving = self.bg is not None and (self.flow is not None or self.animation == "drift")
+        return moving \
             or (self.bg_since is not None and now - self.bg_since < 1.0) \
             or self.leave_since is not None
 
     def on_tick(self, _w, clock):
         now_us = clock.get_frame_time()
-        if self.animating(time.monotonic()):
-            # the drift moves a fraction of a pixel a frame: fps is plenty
-            transitioning = (self.bg_since and time.monotonic() - self.bg_since < 1.0) or self.leave_since
+        now = time.monotonic()
+        if self.animating(now):
+            # flow and drift move a fraction of a pixel a frame: fps is plenty
+            transitioning = (self.bg_since and now - self.bg_since < 1.0) or self.leave_since
             if transitioning or now_us - self.last_frame >= self.period:
                 self.last_frame = now_us
+                if self.flow is not None and self.leave_since is None:
+                    self.bg = self.flow_texture()
                 self.queue_draw()
         return GLib.SOURCE_CONTINUE
 
@@ -925,7 +1069,7 @@ class Backdrop(Gtk.Widget):
             a = ease((now - self.bg_since) / 0.9) if self.bg_since else 1.0
             snapshot.push_clip(full)
             snapshot.push_opacity(a)
-            if self.drift:
+            if self.animation == "drift" and self.flow is None:
                 t = now - self.t0
                 zoom = 1.08 + 0.025 * math.sin(2 * math.pi * t / 47)
                 dx = 0.016 * w * math.sin(2 * math.pi * t / 61 + 1.0)
@@ -999,6 +1143,197 @@ class Avatar(Gtk.DrawingArea):
         cr.stroke()
 
 
+class Media:
+    """What is playing, from the MPRIS players on the session bus (spotify,
+    mpv with mpv-mpris, firefox, mpd with mpDris2...). `changed(state)` is
+    called with a dict, or None when nothing is playing or paused. The one
+    shown is the player playing (the one that started last), else the last
+    one paused."""
+
+    PREFIX = "org.mpris.MediaPlayer2."
+    PATH = "/org/mpris/MediaPlayer2"
+    PLAYER = "org.mpris.MediaPlayer2.Player"
+
+    def __init__(self, changed):
+        from gi.repository import Gio
+        self.Gio = Gio
+        self.changed = changed
+        self.players = {}           # bus name -> state
+        self.recent = []            # bus names, the last to change state first
+        self.current = None
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except GLib.Error as e:
+            log(f"music: no session bus ({e.message})")
+            self.bus = None
+            return
+        self.bus.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                                  "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, self.on_owner)
+        # which player changed is not said by name: refresh them all (few)
+        self.bus.signal_subscribe(None, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                  self.PATH, self.PLAYER, Gio.DBusSignalFlags.NONE,
+                                  lambda *_a: [self.refresh(n) for n in list(self.players)])
+        self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames",
+                      None, GLib.VariantType("(as)"), Gio.DBusCallFlags.NONE, -1, None, self.on_names)
+
+    def wanted(self, name):
+        # playerctld mirrors the other players: it would show everything twice
+        return name.startswith(self.PREFIX) and "playerctld" not in name
+
+    def on_names(self, bus, res):
+        try:
+            names = bus.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        for n in names:
+            if self.wanted(n):
+                self.refresh(n)
+
+    def on_owner(self, _c, _s, _p, _i, _n, params):
+        name, _old, new = params.unpack()
+        if not self.wanted(name):
+            return
+        if new:
+            self.refresh(name)
+        else:
+            self.players.pop(name, None)
+            self.update()
+
+    def refresh(self, name):
+        self.bus.call(name, self.PATH, "org.freedesktop.DBus.Properties", "GetAll",
+                      GLib.Variant("(s)", (self.PLAYER,)), GLib.VariantType("(a{sv})"),
+                      self.Gio.DBusCallFlags.NONE, 2000, None, lambda b, r: self.got(name, b, r))
+
+    def got(self, name, bus, res):
+        try:
+            props = bus.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        md = props.get("Metadata") or {}
+        artist = md.get("xesam:artist") or []
+        if isinstance(artist, str):
+            artist = [artist]
+        state = {
+            "name": name,
+            "player": name[len(self.PREFIX):].split(".")[0].capitalize(),
+            "status": props.get("PlaybackStatus", "Stopped"),
+            "title": str(md.get("xesam:title") or ""),
+            "artist": ", ".join(str(a) for a in artist),
+            "art": str(md.get("mpris:artUrl") or ""),
+            "can_prev": bool(props.get("CanGoPrevious", True)),
+            "can_next": bool(props.get("CanGoNext", True)),
+        }
+        old = self.players.get(name)
+        if old is None or old["status"] != state["status"]:
+            if name in self.recent:
+                self.recent.remove(name)
+            self.recent.insert(0, name)
+        self.players[name] = state
+        self.update()
+
+    def update(self):
+        order = [n for n in self.recent if n in self.players] + \
+                [n for n in self.players if n not in self.recent]
+        pick = None
+        for status in ("Playing", "Paused"):
+            pick = next((self.players[n] for n in order
+                         if self.players[n]["status"] == status
+                         and (self.players[n]["title"] or self.players[n]["artist"])), None)
+            if pick:
+                break
+        if pick != self.current:
+            self.current = pick
+            self.changed(pick)
+
+    def control(self, method):
+        if self.bus is not None and self.current is not None:
+            self.bus.call(self.current["name"], self.PATH, self.PLAYER, method, None, None,
+                          self.Gio.DBusCallFlags.NONE, 2000, None, None)
+
+
+def fetch_art(url):
+    """The bytes of a cover, from file:// or http(s)://; None if it cannot
+    be had quickly. Runs in a thread."""
+    try:
+        if url.startswith("file://"):
+            path = GLib.filename_from_uri(url)[0]
+            if os.path.getsize(path) > 20 << 20:
+                return None
+            with open(path, "rb") as f:
+                return f.read()
+        if url.startswith(("http://", "https://")):
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=4) as r:
+                return r.read(10 << 20)
+    except Exception:
+        pass
+    return None
+
+
+class MediaCard(Gtk.Revealer):
+    """The cover, the title and the artist, with previous / play-pause /
+    next. The buttons never take the keyboard: the password field keeps it."""
+
+    def __init__(self, app):
+        super().__init__(transition_type=Gtk.RevealerTransitionType.CROSSFADE, transition_duration=350)
+        self.app = app
+        self.set_halign(Gtk.Align.CENTER)
+        box = Gtk.Box(css_classes=["media"], spacing=14)
+
+        self.art_stack = Gtk.Stack(css_classes=["art"])
+        self.art_stack.set_overflow(Gtk.Overflow.HIDDEN)
+        self.art_stack.set_size_request(64, 64)
+        self.art_stack.set_valign(Gtk.Align.CENTER)
+        # a Gtk.Picture would ask for the size of the cover; this is 64 px
+        self.picture = Gtk.Image(pixel_size=64)
+        self.art_stack.add_named(Gtk.Label(label="music_note", css_classes=["icon"]), "none")
+        self.art_stack.add_named(self.picture, "art")
+        box.append(self.art_stack)
+
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
+        self.player = Gtk.Label(xalign=0, css_classes=["player"])
+        self.title = Gtk.Label(xalign=0, css_classes=["title"], ellipsize=Pango.EllipsizeMode.END, max_width_chars=26)
+        self.artist = Gtk.Label(xalign=0, css_classes=["artist"], ellipsize=Pango.EllipsizeMode.END, max_width_chars=30)
+        for w in (self.player, self.title, self.artist):
+            text.append(w)
+        box.append(text)
+
+        controls = Gtk.Box(valign=Gtk.Align.CENTER, spacing=2)
+        self.prev = self.button("skip_previous", "Previous")
+        self.play = self.button("play_arrow", "PlayPause", "play")
+        self.next = self.button("skip_next", "Next")
+        for b in (self.prev, self.play, self.next):
+            controls.append(b)
+        box.append(controls)
+        self.set_child(box)
+        self.url = None
+
+    def button(self, icon, method, css=None):
+        b = Gtk.Button(css_classes=[css] if css else [])
+        b.set_child(Gtk.Label(label=icon, css_classes=["icon"]))
+        b.set_focusable(False)
+        b.connect("clicked", lambda _b: self.app.media.control(method))
+        return b
+
+    def update(self, state, texture):
+        if state is None:
+            self.set_reveal_child(False)
+            return
+        self.player.set_label(state["player"].upper())
+        self.title.set_label(state["title"] or state["artist"])
+        self.artist.set_label(state["artist"] if state["title"] else "")
+        self.artist.set_visible(bool(state["artist"] and state["title"]))
+        self.play.get_child().set_label("pause" if state["status"] == "Playing" else "play_arrow")
+        self.prev.set_sensitive(state["can_prev"])
+        self.next.set_sensitive(state["can_next"])
+        if texture is not None:
+            self.picture.set_from_paintable(texture)
+            self.art_stack.set_visible_child_name("art")
+        else:
+            self.art_stack.set_visible_child_name("none")
+        self.set_reveal_child(True)
+
+
 class LockView(Gtk.Overlay):
     """What one output shows."""
 
@@ -1026,9 +1361,13 @@ class LockView(Gtk.Overlay):
         top.set_margin_top(int((geo.height if geo else 1080) * 0.10))
         self.date = Gtk.Label(css_classes=["date"])
         self.clock = Gtk.Label(css_classes=["clock"])
+        self.date.set_can_target(False)
+        self.clock.set_can_target(False)
         top.append(self.date)
         top.append(self.clock)
-        top.set_can_target(False)
+        # what is playing, with its buttons
+        self.media = MediaCard(app)
+        top.append(self.media)
         self.add_overlay(top)
 
         # the user and the password, low down
@@ -1151,6 +1490,9 @@ class Locklet(Gtk.Application):
         self.unlocking = False
         self.lock = None
         self.pool = ThreadPoolExecutor(max_workers=4)
+        self.media = None           # Media, when "music" is on
+        self.media_state = None
+        self.covers = {}            # art url -> Gdk.Texture (None: could not be had)
 
     # ---- setup
 
@@ -1183,6 +1525,8 @@ class Locklet(Gtk.Application):
             self.wallpapers = bgmonad_wallpapers()
         GLib.timeout_add_seconds(1, self.tick)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.on_usr1)
+        if self.cfg["music"]:
+            self.media = Media(self.on_media)
 
         if self.preview:
             win = self.make_window(monitors[0] if monitors else None)
@@ -1229,7 +1573,34 @@ class Locklet(Gtk.Application):
         self.views.append(view)
         win.connect("destroy", lambda _w: self.views.remove(view) if view in self.views else None)
         self.load_background(view, monitor)
+        view.media.update(self.media_state, self.cover(self.media_state))
         return win
+
+    # ---- what is playing
+
+    def cover(self, state):
+        return self.covers.get(state["art"]) if state and state["art"] else None
+
+    def on_media(self, state):
+        self.media_state = state
+        for v in self.views:
+            v.media.update(state, self.cover(state))
+        url = state["art"] if state else ""
+        if url and url not in self.covers:
+            self.covers[url] = None                 # once, even if it fails
+            self.pool.submit(fetch_art, url).add_done_callback(
+                lambda fut: GLib.idle_add(self.cover_ready, url, fut.result()))
+
+    def cover_ready(self, url, data):
+        if data:
+            try:
+                self.covers[url] = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
+            except GLib.Error:
+                pass
+        if self.media_state and self.media_state["art"] == url:
+            for v in self.views:
+                v.media.update(self.media_state, self.covers[url])
+        return False
 
     def load_background(self, view, monitor):
         name = monitor.get_connector() if monitor else None
@@ -1245,7 +1616,7 @@ class Locklet(Gtk.Application):
             if color.parse(bg):
                 view.backdrop.color = color
                 view.backdrop.dim = 0
-            view.backdrop.drift = False
+            view.backdrop.animation = "none"
             view.backdrop.set_background(None)
             return
         if bg == "screenshot":
@@ -1261,26 +1632,40 @@ class Locklet(Gtk.Application):
         w = int((geo.width if geo else 1920) * scale)
         h = int((geo.height if geo else 1080) * scale)
         blur = float(self.cfg["blur"])
+        cfg = self.cfg
+
+        def work():
+            if cfg["animation"] == "flow":
+                flow = prepare_flow(source, w, h, blur, cfg["flow"], cfg["flow_speed"])
+                if flow is not None:
+                    return "flow", flow
+            return "still", blurred_rgb(source, w, h, blur)
 
         def done(fut):
-            GLib.idle_add(self.background_ready, view, source, fut.result(), blur, h)
+            kind, result = fut.result()
+            GLib.idle_add(self.background_ready, view, source, kind, result, blur, h)
 
-        self.pool.submit(blurred_rgb, source, w, h, blur).add_done_callback(done)
+        self.pool.submit(work).add_done_callback(done)
 
-    def background_ready(self, view, source, rgb, blur, h):
-        if rgb is not None:
-            w_, h_, data = rgb
+    def background_ready(self, view, source, kind, result, blur, h):
+        if kind == "flow":
+            view.backdrop.set_flow(result)
+            return False
+        if view.backdrop.animation == "flow":      # no Pillow for the flow
+            view.backdrop.animation = "drift"
+        if result is not None:
+            w_, h_, data = result
             tex = Gdk.MemoryTexture.new(w_, h_, Gdk.MemoryFormat.R8G8B8, GLib.Bytes.new(data), w_ * 3)
             view.backdrop.set_background(tex)
             return False
-        # no Pillow: let GTK load and blur it (every frame, so no drift)
+        # no Pillow: let GTK load and blur it (every frame, so it stays still)
         try:
             tex = Gdk.Texture.new_from_bytes(GLib.Bytes.new(source)) if isinstance(source, bytes) \
                 else Gdk.Texture.new_from_filename(source)
         except GLib.Error as e:
             log(f"cannot read the background: {e.message}")
             return False
-        view.backdrop.drift = False
+        view.backdrop.animation = "none"
         view.backdrop.set_background(tex, blur_fallback=blur * h / max(1, view.get_scale_factor()))
         return False
 

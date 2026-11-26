@@ -10,9 +10,11 @@ in the family of [shotlet](https://github.com/prietus/shotlet),
   locklet crashes or is killed the session stays locked (black); run
   `locklet` again to get the lock screen back;
 - the screen **stays as it was for an instant and crossfades** to your
-  wallpaper, **blurred and darkened, drifting slowly**. It is the one
+  wallpaper, **blurred and darkened, flowing slowly** like bgmonad's. It is the one
   bgmonad shows on that output (asked with `bgmonad status`), so the desktop
   and the lock screen match; without bgmonad, `~/.config/wallpaper`;
+- **what is playing** (any MPRIS player) under the clock, with its cover
+  and previous / play-pause / next;
 - date and clock above; your picture, name and the password below. A wrong
   password shakes the field and says why (also when pam_faillock has
   locked the account for a while); on unlocking the desktop fades back in;
@@ -24,7 +26,7 @@ in the family of [shotlet](https://github.com/prietus/shotlet),
 
 *The lock screen over the wallpaper that
 [bgmonad](https://github.com/prietus/bgmonad) shows on the desktop, blurred
-and darkened; it drifts slowly while locked.*
+and darkened; it flows slowly while locked.*
 
 It is one Python file (GTK 4 and gtk4-layer-shell's session lock); the
 password is checked with PAM through ctypes.
@@ -109,8 +111,10 @@ edit it):
   "background": "wallpaper",
   "blur": 0.025,
   "dim": 0.38,
-  "drift": true,
-  "fps": 30,
+  "animation": "flow",
+  "flow": 0.07,
+  "flow_speed": 1.0,
+  "fps": 20,
   "fade": true,
   "clock": "%H:%M",
   "date": "%A, %-d %B",
@@ -125,7 +129,10 @@ edit it):
 | `background` | `"wallpaper"` (bgmonad's, else `~/.config/wallpaper`), `"screenshot"` (the screen itself), a path to an image, or a colour `"#1e1e2e"` |
 | `blur` | radius as a fraction of the screen height; `0` sharp |
 | `dim` | `0` the picture as it is, `1` black |
-| `drift`, `fps` | the slow zoom and pan, and how often it is drawn |
+| `animation` | `"flow"`: the picture flows slowly, like bgmonad's; `"drift"`: a slow zoom and pan; `"none"`: still |
+| `flow`, `flow_speed` | how far the flow moves the picture (in screen heights) and how fast (1: a swirl takes 10 to 30 s) |
+| `fps` | how often the animation is drawn |
+| `music` | what is playing, with its buttons; `false` hides it |
 | `fade` | start from a screenshot (needs grim) |
 | `clock`, `date` | `strftime` formats; the date follows `LC_TIME` |
 | `avatar` | else `~/.face`, AccountsService's icon or your initial |
@@ -136,10 +143,23 @@ edit it):
 classes `locklet`, `date`, `clock`, `avatar`, `name`, `pill`, `go`,
 `status`).
 
+## The animation
+
+The flow is bgmonad's: a few slow waves travelling in different directions,
+with periods that share no factor, so it never repeats. There is no video
+and nothing on disk: every frame is computed when it is drawn. The waves
+are evaluated on a coarse grid (16 x 9) and Pillow warps the blurred picture
+through it; since the picture is blurred, an eighth of the screen's
+resolution is enough and the GPU scales it up. That is about 2 ms a frame,
+some 9% of a core at 20 fps on a 4K screen.
+
+Frames are drawn only when the compositor asks for one, so with the screen
+off (`screen_off_locked`) nothing is computed at all.
+
 ## Install
 
     pacman -S python-gobject gtk4 gtk4-layer-shell
-    pacman -S python-pillow grim      # optional: blur with drift, crossfade
+    pacman -S python-pillow grim      # optional: blur and flow, crossfade
     git clone https://github.com/prietus/locklet ~/git/locklet
     ln -s ~/git/locklet/locklet ~/.local/bin/locklet
     sudo install -m644 ~/git/locklet/pam/locklet /etc/pam.d/locklet   # optional
