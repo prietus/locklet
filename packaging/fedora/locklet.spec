@@ -1,5 +1,5 @@
 Name:           locklet
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Lock screen for river and rivermonad (ext-session-lock-v1)
 
@@ -52,5 +52,9 @@ install -Dpm 0644 pam/locklet %{buildroot}%{_sysconfdir}/pam.d/locklet
 
 
 %changelog
+* Thu Nov 26 2026 Carlos Prieto Ortiz <prietus@live.com> - 0.2.0-1
+- The wallpaper flows slowly, like bgmonad's ("animation": "flow")
+- What is playing (MPRIS) under the clock, with previous / play-pause / next
+
 * Mon Nov 23 2026 Carlos Prieto Ortiz <prietus@live.com> - 0.1.0-1
 - First release
